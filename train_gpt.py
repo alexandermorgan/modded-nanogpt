@@ -438,7 +438,7 @@ class NorMuonAndAdam:
             self._build_param_cfg(param, label)
 
         # Assert scatter_order and work_order match present labels exactly
-        present = set(self._param_by_label.keys())
+        present = self._param_by_label.keys()
         assert set(scatter_order) == present and set(work_order) == present
 
         # Handle world_size=1: overwrite comms to "none"
@@ -696,7 +696,7 @@ class NorMuonAndAdam:
     def load_state_dict(self, state_dict):
         """Load optimizer state from a dict."""
         # Build id->param mapping
-        id_to_param = {id(p): p for p in self.param_cfgs.keys()}
+        id_to_param = {id(p): p for p in self.param_cfgs}
 
         # Load state, preserving dtypes
         for param_id, saved_p_state in state_dict["param_states"].items():
@@ -1011,7 +1011,7 @@ class Yarn(nn.Module):
             )
         else:
             t_even = 2 * t
-            t_odd = 2 * t + 1
+            t_odd = t_even + 1
             theta1 = torch.outer(t_even, angular_freq)
             theta2 = torch.outer(t_odd, angular_freq)
             self.factor1 = nn.Buffer(
@@ -1039,7 +1039,7 @@ class Yarn(nn.Module):
             self.factor2.copy_(theta.sin())
         else:
             t_even = 2 * t
-            t_odd = 2 * t + 1
+            t_odd = t_even + 1
             theta1 = torch.outer(t_even, self.angular_freq)
             theta2 = torch.outer(t_odd, self.angular_freq)
             self.factor1.copy_(torch.cat((theta1.cos(), theta2.cos()), dim=-1))
@@ -1761,7 +1761,7 @@ class TrainingManager():
         self.optimizer = NorMuonAndAdam(
             model.named_parameters(),
             param_table=self.param_table,
-            scatter_order=list(self.param_table.keys()),  # Dict order defines scatter priority
+            scatter_order=list(self.param_table),  # Dict order defines scatter priority
             work_order=self.work_order,
             adam_defaults=adam_defaults,
             normuon_defaults=normuon_defaults,
