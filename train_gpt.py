@@ -1283,10 +1283,11 @@ class GPT(nn.Module):
         post_lambdas_mlp_ln1  = self.post_lambdas[:, 1, 1].bfloat16().unbind(0)
         x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
-        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
-        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
-        attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
+        ag = self.attn_gate_bank.unbind(0)
+        veg = self.ve_gate_bank.unbind(0)
+        attn_gates = [*ag[:6], None, *ag[6:]]
+        nones = [None] * (self.num_layers - 6)
+        ve_gates = [None, veg[0], veg[1], *nones, veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         attn_weights = self.attn_bank.unbind(0)  # tuple of [4*dim, hdim] tensors
@@ -1302,7 +1303,7 @@ class GPT(nn.Module):
         # Value embeddings - always computed (not precomputed)
         ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
         # Shifted .01 ... 234 structure on token value embeddings by @photomz
-        ve = [None, ve[0], ve[1]] + [None] * (self.num_layers - 6) + [ve[2], ve[3], ve[4]]
+        ve = [None, ve[0], ve[1], *nones, ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
