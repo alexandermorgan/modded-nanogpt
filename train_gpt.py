@@ -1058,6 +1058,11 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
+    use_fp8_compute: bool = False
+
+ATTN_FP8_X_S = 10.0 / 448
+ATTN_FP8_W_S = 1.0 / 448
+ATTN_FP8_GRAD_S = grad_scale * 1.0 / 448
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1084,8 +1089,14 @@ class CausalSelfAttention(nn.Module):
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
         train_max_seq_len = attn_args.train_max_seq_len
+        use_fp8_compute = attn_args.use_fp8_compute
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if use_fp8_compute:
+            w_qkv_t = qkvo_w[:self.dim * 3].T.contiguous()
+            qkv = torch.ops.nanogpt.mm_t(x.reshape(-1, self.dim), w_qkv_t, ATTN_FP8_X_S, ATTN_FP8_W_S, ATTN_FP8_GRAD_S)[0]
+            q, k, v = (qkv * sa_lambdas[0]).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        else:
+            q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1130,7 +1141,11 @@ class CausalSelfAttention(nn.Module):
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
+        if use_fp8_compute:
+            w_o_t = qkvo_w[self.dim * 3:].T.contiguous()
+            y = torch.ops.nanogpt.mm_t(y.reshape(-1, self.dim), w_o_t, ATTN_FP8_X_S, ATTN_FP8_W_S, ATTN_FP8_GRAD_S)[0].view(B, T, self.dim) * sa_lambdas[1]
+        else:
+            y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
 
@@ -1146,6 +1161,7 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
+    use_fp8_compute: bool = False
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1253,6 +1269,7 @@ class GPT(nn.Module):
         # ---- Schedule and layer topology ----
         mtp_weights, train_max_seq_len = schedule_cfg.mtp_weights, schedule_cfg.train_max_seq_len
         ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+        use_fp8_compute = schedule_cfg.use_fp8_compute
 
         # set block masks and key shift
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
@@ -1319,7 +1336,8 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
+                use_fp8_compute=use_fp8_compute,
             )
             # Select weights from banks
             qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
@@ -1571,6 +1589,7 @@ class TrainingStage:
     mtp_weights_end: list[float]
     train_max_seq_len: int
     duration: float = None
+    use_fp8_compute: bool = False
 
 class TrainingSchedule:
     """
@@ -1630,7 +1649,7 @@ class TrainingSchedule:
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
     TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
-                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
+                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0], use_fp8_compute=True),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
     TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
@@ -1737,7 +1756,8 @@ class TrainingManager():
             mtp_weights = self.mtp_weights,
             ws_short = self.ws_short * self.block_size,
             ws_long = self.ws_long * self.block_size,
-            train_max_seq_len = self.train_max_seq_len
+            train_max_seq_len = self.train_max_seq_len,
+            use_fp8_compute = self.use_fp8_compute,
         )
 
     def _is_adam_step(self, step: int):
@@ -1765,6 +1785,7 @@ class TrainingManager():
 
         self.ws_long = new_ws_long
         self.mtp_weights = training_schedule.mtp_weights[step]
+        self.use_fp8_compute = stage.use_fp8_compute
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
@@ -1795,6 +1816,7 @@ class TrainingManager():
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
+        self.use_fp8_compute = stage.use_fp8_compute
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
         if _sparse_comms_active():
