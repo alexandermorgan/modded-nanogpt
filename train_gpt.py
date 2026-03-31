@@ -154,6 +154,104 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
+# FP8 matmul for standard (out_features, in_features) weight layout.
+# Computes y = x @ w.T. The key advantage over using mm_t with a pre-transposed
+# weight is that w_f8.T is already column-major when w is contiguous, so the
+# forward pass avoids the expensive .T.contiguous() copy that mm_t requires.
+# The backward grad_x pays one copy instead, but that's FP8 (1 byte/elem)
+# vs the BF16 caller-side transpose (2 bytes/elem) that mm_t needed.
+
+@torch.library.custom_op("nanogpt::mm", mutates_args=())
+def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    """Computes y = x @ w.T with F8 weights stored as (out_features, in_features)."""
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        assert x.shape[1] == w.shape[1]  # x: (batch, in), w: (out, in)
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+
+        # w_f8 is (out, in) contiguous → w_f8.T is (in, out) column-major.
+        # _scaled_mm requires column-major B, so w_f8.T works directly — no copy.
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[1]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
+def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+
+        x_scale = grad.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
+        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+
+        # grad_x = grad @ w: (M, N) @ (N, K) → (M, K)
+        # w_f8 is (N, K) contiguous (row-major), need column-major for _scaled_mm
+        w_f8_col = w_f8.T.contiguous().T
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8_col,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        # grad_w = grad.T @ x: (N, M) @ (M, K) → (N, K) = (out, in)
+        grad_w = torch._scaled_mm(
+            grad_f8.T.contiguous(),
+            x_f8.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=grad_scale,
+            scale_b=x_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, grad_w
+
+    return impl(g, x_f8, w_f8)
+
+@mm_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward_std(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context_std(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_op.register_autograd(backward_std, setup_context=setup_context_std)
+
 # -----------------------------------------------------------------------------
 # Polar Express
 
@@ -1092,8 +1190,7 @@ class CausalSelfAttention(nn.Module):
         use_fp8_compute = attn_args.use_fp8_compute
 
         if use_fp8_compute:
-            w_qkv_t = qkvo_w[:self.dim * 3].T.contiguous()
-            qkv = torch.ops.nanogpt.mm_t(x.reshape(-1, self.dim), w_qkv_t, ATTN_FP8_X_S, ATTN_FP8_W_S, ATTN_FP8_GRAD_S)[0]
+            qkv = torch.ops.nanogpt.mm(x.reshape(-1, self.dim), qkvo_w[:self.dim * 3], ATTN_FP8_X_S, ATTN_FP8_W_S, ATTN_FP8_GRAD_S)[0]
             q, k, v = (qkv * sa_lambdas[0]).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         else:
             q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
@@ -1142,8 +1239,7 @@ class CausalSelfAttention(nn.Module):
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         if use_fp8_compute:
-            w_o_t = qkvo_w[self.dim * 3:].T.contiguous()
-            y = torch.ops.nanogpt.mm_t(y.reshape(-1, self.dim), w_o_t, ATTN_FP8_X_S, ATTN_FP8_W_S, ATTN_FP8_GRAD_S)[0].view(B, T, self.dim) * sa_lambdas[1]
+            y = torch.ops.nanogpt.mm(y.reshape(-1, self.dim), qkvo_w[self.dim * 3:], ATTN_FP8_X_S, ATTN_FP8_W_S, ATTN_FP8_GRAD_S)[0].view(B, T, self.dim) * sa_lambdas[1]
         else:
             y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
