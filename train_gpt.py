@@ -11,7 +11,9 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'dc_triton_kernels.py'), 'r
     code += f"\n\n{'-'*40}\n# dc_triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
 
+import base64
 import copy
+import functools
 import glob
 import math
 import signal
@@ -1203,9 +1205,50 @@ class CausalSelfAttention(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return math.ceil(v / n) * n
 
-# Preload (download + parse) the GPT-2 tokenizer at import, outside the timed region.
-# build_prefix_table then only pays the table construction itself.
-tiktoken.get_encoding("gpt2")
+# -----------------------------------------------------------------------------
+# SuperBPE vocabulary (branch superbpe_vocab_3digit_splits)
+#
+# This branch trains on alexandermorgan/fineweb-edu10B-superbpe50304-3digit instead of
+# GPT-2 tokens, so everything derived from the tokenizer reads that vocabulary rather
+# than tiktoken's "gpt2". data/cached_superbpe_finewebedu10B.py puts the .tiktoken file
+# next to the shards.
+SUPERBPE_VOCAB_FILE = os.path.join(
+    os.environ.get("DATA_PATH", "."), "data/finewebedu10B_superbpe/superbpe_50304.tiktoken"
+)
+SUPERBPE_EOT_ID = 50303  # <|endoftext|>: the document separator in these shards
+
+@functools.cache
+def superbpe_ranks() -> dict[bytes, int]:
+    """{token bytes: id} for ids 0..50302. Id 50303 is <|endoftext|>, which has no bytes."""
+    try:
+        text = open(SUPERBPE_VOCAB_FILE).read()
+    except FileNotFoundError:
+        raise SystemExit(
+            f"{SUPERBPE_VOCAB_FILE} is missing. Run:\n"
+            "    python data/cached_superbpe_finewebedu10B.py 9"
+        )
+    ranks = {}
+    for line in text.splitlines():
+        if line.strip():
+            tok, rank = line.split()
+            ranks[base64.b64decode(tok)] = int(rank)
+    return ranks
+
+@functools.cache
+def superbpe_byte_lengths(vocab_size: int) -> Tensor:
+    """UTF-8 byte length of every token id, for the bits-per-byte validation metric.
+
+    <|endoftext|> and any padding ids get 0. They cost prediction nats but stand for no
+    text, so their loss is amortized over the bytes that are there.
+    """
+    lengths = torch.zeros(vocab_size, dtype=torch.int64)
+    for b, tid in superbpe_ranks().items():
+        lengths[tid] = len(b)
+    return lengths
+
+# Preload (parse) the vocabulary at import, outside the timed region, so that
+# build_prefix_table below pays only for the table construction itself.
+superbpe_ranks()
 
 def build_prefix_table(vocab_size: int) -> Tensor:
     """Constant lookup table mapping each token to its "prefix token".
@@ -1214,11 +1257,11 @@ def build_prefix_table(vocab_size: int) -> Tensor:
     proper prefix of token T's byte string that is itself a token in the vocabulary.
     Tokens without a valid prefix map to -1 for "ignore this term".
 
-    Derived only from the static GPT-2 vocabulary -- never from the training corpus.
+    Derived only from the static SuperBPE vocabulary -- never from the training corpus.
     Sorting byte strings puts every proper prefix before its extensions, so a stack of
     live ancestors yields the longest one in O(V log V) instead of probing every length.
     """
-    byte_to_id = tiktoken.get_encoding("gpt2")._mergeable_ranks
+    byte_to_id = superbpe_ranks()
     table = [-1] * vocab_size
     stack: list[bytes] = []  # ancestors of the current token, shortest first
     stack_ids: list[int] = []
@@ -1234,13 +1277,15 @@ def build_prefix_table(vocab_size: int) -> Tensor:
 
 # Whether a merge may span the seam between a prev-token end and a cur-token start, by the
 # pretokenizer class of the character on either side of it.
+#
+# Upstream this encodes GPT-2's pretokenizer, which stops merges at word boundaries. This
+# vocabulary is encoded with pat_str = r"[\s\S]+", i.e. no pretokenization at all, so no
+# seam is protected and every entry is True. The two word-boundary rules upstream sets --
+# a whitespace run being one pretoken, and contractions -- do not apply here; keeping them
+# would only mask less than is justified.
 _CLS = "SNLO?"  # whitespace, number, letter, other, inside a character
 _SEAM_OK = np.ones((len(_CLS), len(_CLS)), dtype=bool)
 _SEAM_OK[:, _CLS.index("?")] = False  # cur's pretoken keeps going past cur's end
-_SEAM_OK[_CLS.index("S"), _CLS.index("S")] = False  # a whitespace run is one pretoken
-_SEAM_OK[_CLS.index("O"), _CLS.index("L")] = False  # contractions, see build_canonical_mask
-
-_CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
 
 def _char_cls(ch: str) -> str:
     if ch.isspace() and not "\x1c" <= ch <= "\x1f":
@@ -1257,34 +1302,32 @@ def _edge_cls(b: bytes, first: bool) -> int:
         return _CLS.index(_char_cls(s[0] if first else s[-1]))
     return _CLS.index("?")
 
-def _ends_contraction(text: str) -> bool:
-    for c in _CONTRACTIONS:
-        if text.endswith(c):
-            before = text[:-len(c)]
-            return not before or _char_cls(before[-1]) in "LN"
-    return False
-
 def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarray:
     """Bit-packed (vocab_size, vocab_size // 8) mask of non-canonical (prev, cur) pairs.
 
-    Bit x of row p is set when the GPT-2 tokenizer would never emit token x directly after
-    token p, i.e. encode(decode([..., p, x])) != [..., p, x], so softmax can drop it.
-
-    Since GPT-2 is not pure BPE we need to consider the pretokenization rules.
+    Bit x of row p is set when the encoder would never emit token x directly after token p,
+    i.e. encode(decode([..., p, x])) != [..., p, x], so softmax can drop it.
 
     Set bits have to hold for the pair *in context*, which is stricter than proving
     encode(decode([p, x])) != [p, x]: the mask is applied mid-document, so text on either
     side of the pair gets a vote. Pairs whose answer depends on it are left unset.
 
-    * Left. The seven contraction rules ('s, 't, ...) are dropped and tokens ending in a
-      contraction pretoken mask nothing at all, because whether a "'" opens a pretoken
-      depends on what precedes the previous token.
     * Right. x's first-piece trajectory ends in an unbounded interval, which assumes the
-      pretoken stops at x. When x ends mid-character it demonstrably does not, and a merge
+      piece stops at x. When x ends mid-character it demonstrably does not, and a merge
       inside the continuation can preempt the seam merge at a lower rank -- so the pair
       survives re-encoding after all.
+    * Piece boundaries. This vocabulary does not pretokenize, but its documents are not
+      encoded in one pass either: tokenize_fineweb_edu.py splits at blank lines, and cuts
+      paragraphs over 8,192 characters before a space. A piece therefore starts at a
+      document start, a "\\n", or a " ", and its first token follows the previous piece's
+      last token with no merge between them. Tokens starting with a space or a newline are
+      cleared from every row for that reason. Without this, 428 adjacent pairs in the
+      10,485,760-token validation window would be masked -- each an actual target, which
+      would take a -60 logit and wreck the loss. With it, zero are (verified by replay
+      against the shard); it costs 11% of the masking, 2.4% -> 2.1% of the vocabulary
+      masked per position.
     """
-    ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks if ranks is None else ranks
+    ranks = superbpe_ranks() if ranks is None else ranks
     tok = {v: k for k, v in ranks.items()}
     never = 1 << 30
 
@@ -1322,27 +1365,33 @@ def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarr
 
     by_last, by_first = by_piece(lasts), by_piece(firsts)
 
-    # Pretokenizer class of each token end, and whether a token ends in a contraction
-    # pretoken -- nothing can extend one of those, so it may not mask anything.
+    # Character class of each token edge. Upstream also tracks tokens ending in a
+    # contraction pretoken; without pretokenization there is no such thing here.
     end_cls = np.full(vocab_size, _CLS.index("?"), dtype=np.intp)
     start_cls = np.full(vocab_size, _CLS.index("?"), dtype=np.intp)
-    closed = np.zeros(vocab_size, dtype=bool)
     for tid, b in tok.items():
         end_cls[tid], start_cls[tid] = _edge_cls(b, first=False), _edge_cls(b, first=True)
-        try:
-            closed[tid] = _ends_contraction(b.decode())
-        except UnicodeDecodeError:
-            pass  # ends mid-character, so it cannot end in a contraction
 
     mask = np.zeros((vocab_size, vocab_size), dtype=bool)
     for rank, (a, b) in rules.items():
         ps = np.array([p for s, e, p in by_last.get(a, ()) if s <= rank < e], dtype=np.intp)
-        ps = ps[~closed[ps]]
         xs = np.array([x for s, e, x in by_first.get(b, ()) if s <= rank < e], dtype=np.intp)
         if len(ps) and len(xs):
             mask[np.ix_(ps, xs)] |= _SEAM_OK[np.ix_(end_cls[ps], start_cls[xs])]
 
+    # A token that can begin a piece can follow anything: see "Piece boundaries" above.
+    piece_start = np.zeros(vocab_size, dtype=bool)
+    for tid, b in tok.items():
+        piece_start[tid] = b[:1] in (b" ", b"\n")
+    mask[:, piece_start] = False
+
     return np.packbits(mask, axis=1, bitorder="little")
+
+# Canonical masking is ON, against the SuperBPE vocabulary: build_canonical_mask above
+# drops the pretokenizer seam rules (this encoder does not pretokenize) and never masks a
+# token that can begin a piece. Set this to False to fall back to model.canon_mask staying
+# all-zero, which is simply no masking.
+USE_CANONICAL_MASK = True
 
 class BackgroundCanonicalMask:
     """Builds the canonical mask concurrently with training, in a forked child process.
@@ -1357,9 +1406,9 @@ class BackgroundCanonicalMask:
         self.print0 = print0
         self.buf = self.ranks = self.pid = None
         self.pinned = False
-        if owner:
+        if owner and USE_CANONICAL_MASK:
             self.buf = torch.empty(vocab_size, vocab_size // 8, dtype=torch.uint8).share_memory_()
-            self.ranks = tiktoken.get_encoding("gpt2")._mergeable_ranks  # cached, but takes a lock
+            self.ranks = superbpe_ranks()  # see USE_CANONICAL_MASK before turning this on
             # Page-lock the buffer so that collect's H2D is a direct DMA rather than a staged
             # copy, roughly 10ms instead of 50. Registering is itself slow, which is why it
             # belongs here, before the clock. The mapping is MAP_SHARED, so the child still
@@ -2083,7 +2132,7 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-BOS_ID = 50256
+BOS_ID = SUPERBPE_EOT_ID  # 50303 in this vocabulary; GPT-2's <|endoftext|> was 50256
 TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 49152: 128}
 
 class Shard:
@@ -2258,8 +2307,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
+    train_files: str = os.path.join(data_path, "data/finewebedu10B_superbpe/fineweb_train_*.bin") # input .bin to train on
+    val_files: str = os.path.join(data_path, "data/finewebedu10B_superbpe/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
@@ -2697,6 +2746,10 @@ train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].b
 # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
 canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=master_process, print0=print0)
 
+# Byte length of every token id, for the bits-per-byte validation metric. Built before the
+# clock starts: it is a metric, not part of training.
+token_byte_lengths = superbpe_byte_lengths(model.vocab_size).cuda()
+
 gc.collect()
 
 training_time_ms = 0
@@ -2729,14 +2782,28 @@ for step in range(train_steps + 1):
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
+        # Bits per byte, so this run can be compared with runs that use a different
+        # tokenizer: nats per token depends on how much text a token holds. Counts the
+        # UTF-8 bytes of the actual target tokens, so it follows val_tokens automatically.
+        val_bytes = torch.zeros((), dtype=torch.float64, device="cuda")
+        val_ntok = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                val_bytes += token_byte_lengths[targets].sum()
+                val_ntok += targets.numel()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        dist.reduce(val_bytes, 0, op=dist.ReduceOp.SUM)
+        # val_loss is the mean over tokens, so total nats = val_loss * total tokens.
+        val_bpb = val_loss.double() * (val_ntok * world_size) / (val_bytes * math.log(2))
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_step:
+            print0(f"final val_loss:{val_loss:.4f} nats/token over {val_ntok * world_size:,} tokens "
+                   f"= {int(val_bytes.item()):,} bytes -> val_bpb:{val_bpb:.4f} bits/byte "
+                   f"({val_bytes.item() / (val_ntok * world_size):.3f} bytes/token)", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()

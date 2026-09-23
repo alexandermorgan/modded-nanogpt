@@ -1,4 +1,114 @@
-# Modded-NanoGPT
+# Modded-NanoGPT — branch `superbpe_vocab_3digit_splits`
+
+This branch swaps the GPT-2 tokens for **FineWeb-Edu 10B tokenized with a 50,304-token
+SuperBPE vocabulary**
+([`alexandermorgan/fineweb-edu10B-superbpe50304-3digit`](https://huggingface.co/datasets/alexandermorgan/fineweb-edu10B-superbpe50304-3digit)),
+to find out whether the tokenizer speeds up the run. Everything else is untouched.
+
+## Running the experiment (1× H100)
+
+Both arms use one GPU, so neither can be compared with the official 8×H100 records, only
+with each other. Run them on the same instance, back to back, twice each.
+
+**Baseline (`master`, GPT-2 tokens):**
+```bash
+git checkout master
+pip install -r requirements.txt
+python data/cached_fineweb10B.py 9
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+```
+
+**This branch (SuperBPE tokens):**
+```bash
+git checkout superbpe_vocab_3digit_splits
+python data/cached_superbpe_finewebedu10B.py 9   # ~1.8 GB, max 77 chunks
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+```
+
+`run.sh` is left at the upstream 8 GPUs, so pass `--nproc_per_node` yourself for a
+single-GPU run. `grad_accum_steps = 8 // world_size` keeps the per-step token count the
+same as one rank of an 8-GPU run.
+
+The two datasets land in different directories (`data/fineweb10B/` and
+`data/finewebedu10B_superbpe/`), so both can be present at once and switching branches needs
+no re-download.
+
+## Comparing the results
+
+Validation loss in nats per token **cannot** be compared across tokenizers: a SuperBPE token
+carries about 5.9 bytes against GPT-2's ~4.4, so the same model quality shows up as a higher
+per-token loss here. This branch therefore logs bits per byte next to the usual figure:
+
+```
+step:1290/1290 val_loss:3.9012 val_bpb:0.9421 train_time:...
+final val_loss:3.9012 nats/token over 10485760 tokens = 61877597 bytes -> val_bpb:0.9421 bits/byte (5.901 bytes/token)
+```
+
+`val_bpb = val_loss × tokens ÷ bytes ÷ ln 2`, where bytes are the UTF-8 bytes of the target
+tokens. `<|endoftext|>` counts as 0 bytes, so its cost is amortized over the real text.
+
+The `master` baseline only prints nats. Convert it with the byte count of the GPT-2
+validation window:
+
+```python
+import numpy as np, tiktoken
+enc = tiktoken.get_encoding("gpt2")
+t = np.memmap("data/fineweb10B/fineweb_val_000000.bin", dtype=np.uint16, offset=1024)[:10_485_760]
+b = sum(len(enc.decode_single_token_bytes(int(i))) for i in t if i != 50256)
+print("bits per byte =", "val_loss *", 10_485_760 / (b * np.log(2)))
+```
+
+Two caveats when reading the numbers:
+
+1. **Corpus and tokenizer change together.** `master` trains on FineWeb; this branch trains
+   on FineWeb-Edu. To isolate the tokenizer, run the baseline on `kjj0/finewebedu10B-gpt2`
+   instead (see `data/cached_finewebedu10B.py`, whose files are named `finewebedu_*.bin`, so
+   point `train_files`/`val_files` at them).
+2. **Canonical masking (record 91) is kept, rebuilt for this vocabulary.** Both arms get
+   it, so neither is handicapped. See the change table below for what had to be adjusted.
+
+## What changed from `master`
+
+| Where | Change |
+|---|---|
+| `train_gpt.py` | `BOS_ID = 50303` (`<\|endoftext\|>` in this vocabulary, was GPT-2's 50256) |
+| `train_gpt.py` | `train_files`/`val_files` → `data/finewebedu10B_superbpe/` |
+| `train_gpt.py` | `superbpe_ranks()` reads the published `.tiktoken`; `build_prefix_table` uses it instead of `tiktoken.get_encoding("gpt2")` |
+| `train_gpt.py` | `build_canonical_mask` rebuilt for this vocabulary (see below) |
+| `train_gpt.py` | Validation logs `val_bpb` alongside `val_loss` |
+| `data/cached_superbpe_finewebedu10B.py` | New download script (shards + vocabulary) |
+
+### Canonical masking with this vocabulary
+
+Record 91 masks `(prev, cur)` pairs the tokenizer would never emit. Two of its assumptions
+come from GPT-2 and had to be replaced:
+
+* **Pretokenization.** Upstream stops merges at word boundaries (whitespace runs,
+  contractions). This vocabulary is encoded with `pat_str = r"[\s\S]+"`, so no seam is
+  protected and `_SEAM_OK` is all True apart from the mid-character rule. That masks
+  *more*, not less.
+* **One-pass documents.** `tokenize_fineweb_edu.py` splits at blank lines and cuts
+  paragraphs over 8,192 characters before a space, so a piece can begin after any token.
+  Tokens starting with `' '` or `'\n'` are therefore cleared from every row.
+
+Verified by replaying the finished mask against the shards:
+
+| | Pairs wrongly masked in the 10,485,760-token val window | Vocabulary masked per position |
+|---|---|---|
+| Without the piece-boundary rule | 428 | 2.4% |
+| As committed | **0** | **2.1%** |
+
+Also 0 wrongly masked in the first 20M tokens of `fineweb_train_000001.bin`. The check is
+tied to the data, so re-run it if `val_tokens` grows or the shards are ever regenerated with
+a different `--max-piece`.
+
+Unchanged and verified as compatible: `GPT(vocab_size=50257)` still pads to 50,304, which
+holds every id here; and the per-batch document caps are not exceeded by these shards
+(worst case 49/63, 85/95, 114/127 per rank across the three stages; 407/895 for validation).
+
+---
+
+# Modded-NanoGPT (upstream README)
 
 This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|competitively) search for the fastest algorithm to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
