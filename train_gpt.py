@@ -2258,8 +2258,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
+    train_files: str = os.path.join(data_path, "data/finewebedu10B/finewebedu_train_*.bin") # input .bin to train on
+    val_files: str = os.path.join(data_path, "data/finewebedu10B/finewebedu_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
@@ -2697,6 +2697,16 @@ train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].b
 # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
 canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=master_process, print0=print0)
 
+# Byte length of every GPT-2 token, for the bits-per-byte validation metric. <|endoftext|>
+# gets 0: it costs prediction nats but stands for no text. Built before the clock starts;
+# it is a metric, not part of training.
+_gpt2 = tiktoken.get_encoding("gpt2")
+token_byte_lengths = torch.zeros(model.vocab_size, dtype=torch.int64)
+for _tid in range(50257):
+    token_byte_lengths[_tid] = len(_gpt2.decode_single_token_bytes(_tid))
+token_byte_lengths[50256] = 0
+token_byte_lengths = token_byte_lengths.cuda()
+
 gc.collect()
 
 training_time_ms = 0
@@ -2729,14 +2739,28 @@ for step in range(train_steps + 1):
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
+        # Bits per byte, to compare against runs that use a different tokenizer: nats per
+        # token depends on how much text a token holds. Sums the UTF-8 bytes of the actual
+        # target tokens, so it follows val_tokens automatically.
+        val_bytes = torch.zeros((), dtype=torch.float64, device="cuda")
+        val_ntok = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                val_bytes += token_byte_lengths[targets].sum()
+                val_ntok += targets.numel()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        dist.reduce(val_bytes, 0, op=dist.ReduceOp.SUM)
+        # val_loss is the mean over tokens, so total nats = val_loss * total tokens.
+        val_bpb = val_loss.double() * (val_ntok * world_size) / (val_bytes * math.log(2))
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_step:
+            print0(f"final val_loss:{val_loss:.4f} nats/token over {val_ntok * world_size:,} tokens "
+                   f"= {int(val_bytes.item()):,} bytes -> val_bpb:{val_bpb:.4f} bits/byte "
+                   f"({val_bytes.item() / (val_ntok * world_size):.3f} bytes/token)", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()

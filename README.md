@@ -1,4 +1,30 @@
-# Modded-NanoGPT
+# Modded-NanoGPT — branch `gpt2_finewebedu_control`
+
+Control arm for the SuperBPE tokenizer experiment: the current record, unchanged, trained on
+**FineWeb-Edu in GPT-2 tokens** ([`kjj0/finewebedu10B-gpt2`](https://huggingface.co/datasets/kjj0/finewebedu10B-gpt2)).
+
+`master` trains on FineWeb, while `superbpe_vocab_3digit_splits` trains on FineWeb-Edu with a
+SuperBPE vocabulary, so comparing those two changes corpus and tokenizer at once. This branch
+holds the corpus fixed at FineWeb-Edu so the only difference left is the tokenizer.
+
+```bash
+python data/cached_finewebedu10B.py 9
+torchrun --standalone --nproc_per_node=1 train_gpt.py   # or ./run.sh on 8 GPUs
+```
+
+Changes from `master`: `train_files`/`val_files` point at `data/finewebedu10B/`, and validation
+logs `val_bpb` beside `val_loss` so the arms can be compared in bits per byte (per-token loss
+is not comparable across tokenizers). `BOS_ID` stays 50256 — these shards prefix every document
+with GPT-2's `<|endoftext|>`, the same convention as the FineWeb shards.
+
+Reference numbers for this dataset, measured on `finewebedu_val_000000.bin`: the 10,485,760-token
+validation window is 48,313,295 UTF-8 bytes (4.608 bytes/token), so `bpb = val_loss × 0.313118`,
+and 3.28 nats/token would be 1.0270 bits/byte. Canonical masking (record 91) is left on: replayed
+against the whole val shard it masks none of its 99,999,999 adjacent pairs.
+
+---
+
+# Modded-NanoGPT (upstream README)
 
 This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|competitively) search for the fastest algorithm to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
