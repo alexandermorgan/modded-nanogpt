@@ -4,9 +4,9 @@ The ANVIL2 record trainer (master, plus the bits-per-byte control `anvil2_bpb_co
 **FineWeb-Edu 10B tokenized with a 50,304-token SuperBPE vocabulary**
 ([`alexandermorgan/fineweb-edu10B-superbpe50304-3digit`](https://huggingface.co/datasets/alexandermorgan/fineweb-edu10B-superbpe50304-3digit)),
 whose first phase splits numbers into groups of up to 3 digits. It asks whether the tokenizer
-speeds up the run. Sibling branches differ only in `track_1_short/superbpe_vocab.py`:
-`superbpe_vocab_nodigitsplit` (same corpus, no digit splits) and `superbpe_vocab_gpt2split`
-(FineWeb, as master, with GPT-2's first-phase split).
+speeds up the run. Sibling branches: `superbpe_vocab_nodigitsplit` (same corpus, no digit
+splits) differs only in `track_1_short/superbpe_vocab.py`; `superbpe_vocab_gpt2split` (FineWeb,
+as master, with GPT-2's first-phase split) also enlarges the cu_seqlens table in `data.py`.
 
 ```bash
 python data/cached_superbpe.py 9   # shards + vocabulary into data/finewebedu10B_superbpe/
@@ -36,20 +36,25 @@ not with the record.
 |---|---|
 | `track_1_short/superbpe_vocab.py` | New: dataset, data directory, `<\|endoftext\|>` = 50303, and the `.tiktoken` vocabulary reader |
 | `track_1_short/config.py` | `train_files` / `val_files` → `data/finewebedu10B_superbpe/` |
-| `track_1_short/data.py` | `BOS_ID = 50303`; cu_seqlens rows 64/96/128/128 → 96/128/160/192 |
+| `track_1_short/data.py` | `BOS_ID = 50303` |
 | `track_1_short/sampled_softmax.py` | candidate counts: stage 1 10240 → 12288, stage 2 14336 → 16384 (first two thirds) |
 | `track_1_short/model/prefix_prediction.py` | prefix table from the SuperBPE vocabulary |
 | `track_1_short/canonical_mask.py` | rebuilt for this vocabulary (below) |
 | `track_1_short/bits_per_byte.py` | byte lengths from the SuperBPE vocabulary |
 | `data/cached_superbpe.py` | New download script |
 
-**Why the two size changes.** Replaying master's loader over each SuperBPE dataset's first
-train shard: a microbatch holds more distinct targets than with GPT-2, because the vocabulary is
-used more evenly (worst mean/max 10,714/11,495 at batch 16, against GPT-2's 7,211/8,032). Upstream's
-sampled-softmax counts would trip `assert num_targets <= P` on most stage-1 steps. FineWeb
-documents are also fewer tokens under SuperBPE (541 against GPT-2's 691), which overflows the
-per-batch cu_seqlens table. The new values are the smallest legal ones that keep master's safety
-margin. Stage 0's count and the last third of stage 2 were already large enough.
+**Why the candidate counts changed.** Replaying master's loader over each SuperBPE dataset's
+first train shard: a microbatch holds more distinct targets than with GPT-2, because the
+vocabulary is used more evenly (worst mean/max 10,714/11,495 at batch 16, against GPT-2's
+7,211/8,032). Upstream's sampled-softmax counts would trip `assert num_targets <= P` on most
+stage-1 steps. The new values are the smallest legal ones that keep master's safety margin.
+Stage 0's count and the last third of stage 2 were already large enough.
+
+**The cu_seqlens table is upstream's here.** The table holds one row per document (attention
+segment) in a fixed-token batch. FineWeb-Edu documents average 790 SuperBPE tokens, longer than
+GPT-2 FineWeb's 691, so they need fewer rows than the control: at most 45/75/87/101 against
+64/96/128/128. `superbpe_vocab_gpt2split` enlarges it, because FineWeb under SuperBPE averages
+541 tokens per document and overflows upstream's 96 and 128.
 
 **Canonical mask.** This vocabulary is encoded with `pat_str = [\s\S]+` (no pretokenization), so
 the GPT-2 seam rules (whitespace runs, contractions) are dropped. Documents are split at blank

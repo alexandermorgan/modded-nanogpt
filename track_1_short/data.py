@@ -72,11 +72,7 @@ class Batch(NamedTuple):
     inputs_cpu: np.ndarray  # host copy: the value_embeds row-pull want lists are built from it
 
 # Rows of the packed cu_seqlens table per local batch size (tokens per rank); 40960 is the batch-20 taper.
-# Raised from upstream's {64, 96, 128, 128}: SuperBPE documents are fewer tokens, so more of them fit in a
-# batch. Replaying the loader over fineweb_train_000001.bin of the fineweb10B-superbpe50304-gpt2split
-# dataset (the shortest documents of the three) gives mean/max 42/63, 70/102, 86/125 and 103/142 rows,
-# which overflowed upstream's 96 and 128. These keep master's margin (5+ sd) over that mean.
-TRAIN_MAX_NUM_DOCS = {16384: 96, 32768: 128, 40960: 160, 49152: 192}
+TRAIN_MAX_NUM_DOCS = {16384: 64, 32768: 96, 40960: 128, 49152: 128}
 
 
 def cu_seqlens_rows(tokens_per_rank: int) -> int:
