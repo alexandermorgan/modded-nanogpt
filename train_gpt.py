@@ -30,6 +30,7 @@ import torch.distributed as dist
 from torch import nn
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+from track_1_short.bits_per_byte import bits_per_byte, token_byte_lengths
 from track_1_short.canonical_mask import BackgroundCanonicalMask
 from track_1_short.config import (
     LR_COOLDOWN_FRAC,
@@ -293,6 +294,9 @@ def main():
     # is what the intermediate validations run with. Only the buffer is allocated here; the build
     # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
+    # Byte length of every token id, for the bits-per-byte validation metric. Built off the clock: it is
+    # a metric, not part of training.
+    val_byte_lengths = token_byte_lengths(model.vocab_size, env.device)
 
     # No cyclic GC inside the timed loop: a multi-ms generation-2 pause on one rank stalls every rank at
     # the next collective. What survives until now is frozen out of all future scans; the garbage the
@@ -323,7 +327,7 @@ def main():
         last_step = (step == training_schedule.total_steps)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step or args.is_val_step(step):
             # The deferred gathers land first: validation reads the banks and, at the last step, ships
             # into them.
             if last_step:
@@ -360,15 +364,24 @@ def main():
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loss = 0
+            # UTF-8 bytes of this rank's target tokens, for bits per byte (bits_per_byte.py).
+            val_bytes = torch.zeros((), dtype=torch.int64, device=env.device)
             with torch.no_grad():
                 for batch, pull in zip(val_batches, val_pulls):
                     ngram_table.land(pull)
                     val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
                                       training_manager.get_forward_args()).mean()
+                    val_bytes += val_byte_lengths[batch.targets].sum()
             val_loss /= val_steps
             del val_batches, val_pulls
             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            dist.reduce(val_bytes, 0, op=dist.ReduceOp.SUM)
+            # val_loss is the mean over every rank's tokens, val_tokens in all.
+            val_bpb = bits_per_byte(val_loss.item(), args.val_tokens, val_bytes.item())
+            print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            if last_step:
+                print0(f"final val_loss:{val_loss:.4f} nats/token over {args.val_tokens:,} tokens = {val_bytes.item():,} bytes "
+                       f"-> val_bpb:{val_bpb:.4f} bits/byte ({val_bytes.item() / args.val_tokens:.3f} bytes/token)", console=True)
             # The clock is stopped: flush the log and collect the loop's garbage here.
             flush_log()
             gc.collect()

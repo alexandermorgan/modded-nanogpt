@@ -30,11 +30,21 @@ class Hyperparameters:
     # Every how many steps to evaluate val loss; 0 = only at the end (record #360: each intermediate
     # validation is on the clock -- the val reads and n-gram pulls, the value_embeds gather, the drained
     # CUDA-graph run-ahead and the cycle re-land after it cost ~0.2-0.5 s over a run at 250).
-    val_loss_every: int = 0
+    val_loss_every: int = 250
+    # From this step on, evaluate every val_dense_every steps instead, to trace the end of the loss
+    # curve (bits-per-byte tokenizer experiment). 0 turns the dense phase off.
+    val_dense_from: int = 600
+    val_dense_every: int = 25
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # reproducibility: unset means a random init; any integer (0 included) seeds it
     train_seed: int | None = int(os.environ["TRAIN_SEED"]) if "TRAIN_SEED" in os.environ else None
+
+    def is_val_step(self, step: int) -> bool:
+        """Whether to validate at `step`, the final step aside (always validated)."""
+        dense = self.val_dense_every > 0 and step >= self.val_dense_from
+        every = self.val_dense_every if dense else self.val_loss_every
+        return every > 0 and step % every == 0
 
 @dataclass(slots=True)
 class TrainingStage:
