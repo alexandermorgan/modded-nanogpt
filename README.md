@@ -3,8 +3,10 @@
 The ANVIL2 record trainer (master, plus the bits-per-byte control `anvil2_bpb_control`) on
 **FineWeb 10B (the corpus master trains on) tokenized with a 50,304-token SuperBPE vocabulary whose first phase uses GPT-2's split pattern**, a semi-control: the corpus and first-phase split match the control, and only the SuperBPE second phase is new
 ([`alexandermorgan/fineweb10B-superbpe50304-gpt2split`](https://huggingface.co/datasets/alexandermorgan/fineweb10B-superbpe50304-gpt2split)).
-It is a copy of `superbpe_vocab_3digit_splits` that differs only in the dataset constants of
-`track_1_short/superbpe_vocab.py`; everything below applies unchanged.
+It is a copy of `superbpe_vocab_3digit_splits` that differs in the dataset constants of
+`track_1_short/superbpe_vocab.py` and, unlike the two FineWeb-Edu branches, also enlarges the
+cu_seqlens table in `data.py` (see below): FineWeb documents average 541 SuperBPE tokens against
+GPT-2's 691 (FineWeb-Edu's: 790), so more fit in a batch and overflow upstream's table.
 
 ```bash
 python data/cached_superbpe.py 9   # shards + vocabulary into data/fineweb10B_superbpe_gpt2split/

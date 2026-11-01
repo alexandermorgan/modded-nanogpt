@@ -6,7 +6,9 @@ everything derived from the tokenizer reads it from here instead of tiktoken's "
 bits-per-byte byte lengths. data/cached_superbpe.py downloads HF_REPO into DATA_DIR, the .tiktoken
 vocabulary included.
 
-The SuperBPE branches differ from each other only in the constants below.
+The SuperBPE branches differ from each other only in the constants below, except that this branch
+(superbpe_vocab_gpt2split) also enlarges the cu_seqlens table in data.py: its documents are shorter in
+tokens than the FineWeb-Edu ones and overflow upstream's.
 """
 import base64
 import functools
