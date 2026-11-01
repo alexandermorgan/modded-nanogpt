@@ -1,15 +1,13 @@
-# Modded-NanoGPT — branch `superbpe_vocab_3digit_splits`
+# Modded-NanoGPT — branch `superbpe_vocab_nodigitsplit`
 
 The ANVIL2 record trainer (master, plus the bits-per-byte control `anvil2_bpb_control`) on
-**FineWeb-Edu 10B tokenized with a 50,304-token SuperBPE vocabulary**
-([`alexandermorgan/fineweb-edu10B-superbpe50304-3digit`](https://huggingface.co/datasets/alexandermorgan/fineweb-edu10B-superbpe50304-3digit)),
-whose first phase splits numbers into groups of up to 3 digits. It asks whether the tokenizer
-speeds up the run. Sibling branches differ only in `track_1_short/superbpe_vocab.py`:
-`superbpe_vocab_nodigitsplit` (same corpus, no digit splits) and `superbpe_vocab_gpt2split`
-(FineWeb, as master, with GPT-2's first-phase split).
+**FineWeb-Edu 10B tokenized with a 50,304-token SuperBPE vocabulary whose first phase leaves digit runs unsplit**
+([`alexandermorgan/fineweb-edu10B-superbpe50304-nodigitsplit`](https://huggingface.co/datasets/alexandermorgan/fineweb-edu10B-superbpe50304-nodigitsplit)).
+It is a copy of `superbpe_vocab_3digit_splits` that differs only in the dataset constants of
+`track_1_short/superbpe_vocab.py`; everything below applies unchanged.
 
 ```bash
-python data/cached_superbpe.py 9   # shards + vocabulary into data/finewebedu10B_superbpe/
+python data/cached_superbpe.py 9   # shards + vocabulary into data/finewebedu10B_superbpe_nodigitsplit/
 bash run.sh                        # 8xH100, as master
 ```
 
@@ -32,7 +30,7 @@ clock, so `train_time` compares between arms but not with the record.
 | Where | Change |
 |---|---|
 | `track_1_short/superbpe_vocab.py` | New: dataset, data directory, `<\|endoftext\|>` = 50303, and the `.tiktoken` vocabulary reader |
-| `track_1_short/config.py` | `train_files` / `val_files` → `data/finewebedu10B_superbpe/` |
+| `track_1_short/config.py` | `train_files` / `val_files` → `data/finewebedu10B_superbpe_nodigitsplit/` |
 | `track_1_short/data.py` | `BOS_ID = 50303`; cu_seqlens rows 64/96/128/128 → 96/128/160/192 |
 | `track_1_short/sampled_softmax.py` | candidate counts: stage 1 10240 → 12288, stage 2 14336 → 16384 (first two thirds) |
 | `track_1_short/model/prefix_prediction.py` | prefix table from the SuperBPE vocabulary |

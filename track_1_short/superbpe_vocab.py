@@ -12,8 +12,8 @@ import base64
 import functools
 import os
 
-HF_REPO = "alexandermorgan/fineweb-edu10B-superbpe50304-3digit"
-DATA_DIR = "data/finewebedu10B_superbpe"  # relative to DATA_PATH, like upstream's data/fineweb10B
+HF_REPO = "alexandermorgan/fineweb-edu10B-superbpe50304-nodigitsplit"
+DATA_DIR = "data/finewebedu10B_superbpe_nodigitsplit"  # relative to DATA_PATH, like upstream's data/fineweb10B
 TRAIN_SHARDS = 77  # fineweb_train_000001.bin .. fineweb_train_000077.bin
 
 # <|endoftext|>, the document separator in these shards. Id 50303 has no bytes and no merge rank.
