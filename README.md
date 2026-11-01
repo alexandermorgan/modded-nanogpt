@@ -21,10 +21,12 @@ step:1194/1194 val_loss:… val_bpb:… train_time:…
 final val_loss:… nats/token over 10,485,760 tokens = … bytes -> val_bpb:… bits/byte (… bytes/token)
 ```
 
-Validation runs at steps 0, 250, 500, then every 25 steps from step 600, all with the canonical
-mask (built before the clock, unlike upstream). Only the final one evaluates the tail-averaged
-weights with the extended attention window. Intermediate validations run on the clock, so
-`train_time` compares between arms but not with the record.
+Validation runs at steps 0, 250, 500, then every 25 steps from step 600. The canonical mask is
+built on the clock alongside training, as upstream, but collected at step 600 rather than at the
+end, so every validation from step 600 on is masked; the earlier ones are marked `(unmasked)`.
+Only the final validation evaluates the tail-averaged weights with the extended attention
+window. Intermediate validations run on the clock, so `train_time` compares between arms but
+not with the record.
 
 ## What changed from `anvil2_bpb_control`
 
@@ -52,7 +54,7 @@ the GPT-2 seam rules (whitespace runs, contractions) are dropped. Documents are 
 lines and long paragraphs are cut before a space, so tokens starting with `' '` or `'\n'` are never
 masked. Replaying the mask against each dataset's val window and first 20M train tokens finds
 0 masked real pairs for all three SuperBPE datasets. The build takes ~12 s on a laptop (GPT-2's: ~5 s),
-before the clock starts.
+in the background during training, as upstream.
 
 | dataset | val window bytes | bytes/token | mask density |
 |---|---|---|---|
