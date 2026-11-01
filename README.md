@@ -52,7 +52,7 @@ Stage 0's count and the last third of stage 2 were already large enough.
 
 **The cu_seqlens table is upstream's here.** The table holds one row per document (attention
 segment) in a fixed-token batch. FineWeb-Edu documents average 790 SuperBPE tokens, longer than
-GPT-2 FineWeb's 691, so they need fewer rows than the control: at most 45/75/87/101 against
+GPT-2 FineWeb's 691, so they need fewer rows than the control: at most 47/75/89/101 against
 64/96/128/128. `superbpe_vocab_gpt2split` enlarges it, because FineWeb under SuperBPE averages
 541 tokens per document and overflows upstream's 96 and 128.
 
