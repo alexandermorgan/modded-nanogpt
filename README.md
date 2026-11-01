@@ -1,110 +1,72 @@
 # Modded-NanoGPT — branch `superbpe_vocab_3digit_splits`
 
-This branch swaps the GPT-2 tokens for **FineWeb-Edu 10B tokenized with a 50,304-token
-SuperBPE vocabulary**
+The ANVIL2 record trainer (master, plus the bits-per-byte control `anvil2_bpb_control`) on
+**FineWeb-Edu 10B tokenized with a 50,304-token SuperBPE vocabulary**
 ([`alexandermorgan/fineweb-edu10B-superbpe50304-3digit`](https://huggingface.co/datasets/alexandermorgan/fineweb-edu10B-superbpe50304-3digit)),
-to find out whether the tokenizer speeds up the run. Everything else is untouched.
+whose first phase splits numbers into groups of up to 3 digits. It asks whether the tokenizer
+speeds up the run. Sibling branches differ only in `track_1_short/superbpe_vocab.py`:
+`superbpe_vocab_nodigitsplit` (same corpus, no digit splits) and `superbpe_vocab_gpt2split`
+(FineWeb, as master, with GPT-2's first-phase split).
 
-## Running the experiment (1× H100)
-
-Both arms use one GPU, so neither can be compared with the official 8×H100 records, only
-with each other. Run them on the same instance, back to back, twice each.
-
-**Baseline (`master`, GPT-2 tokens):**
 ```bash
-git checkout master
-pip install -r requirements.txt
-python data/cached_fineweb10B.py 9
-torchrun --standalone --nproc_per_node=1 train_gpt.py
+python data/cached_superbpe.py 9   # shards + vocabulary into data/finewebedu10B_superbpe/
+bash run.sh                        # 8xH100, as master
 ```
 
-**This branch (SuperBPE tokens):**
-```bash
-git checkout superbpe_vocab_3digit_splits
-python data/cached_superbpe_finewebedu10B.py 9   # ~1.8 GB, max 77 chunks
-torchrun --standalone --nproc_per_node=1 train_gpt.py
-```
+## Reading the results
 
-`run.sh` is left at the upstream 8 GPUs, so pass `--nproc_per_node` yourself for a
-single-GPU run. `grad_accum_steps = 8 // world_size` keeps the per-step token count the
-same as one rank of an 8-GPU run.
-
-The two datasets land in different directories (`data/fineweb10B/` and
-`data/finewebedu10B_superbpe/`), so both can be present at once and switching branches needs
-no re-download.
-
-## Comparing the results
-
-Validation loss in nats per token **cannot** be compared across tokenizers: a SuperBPE token
-carries about 5.9 bytes against GPT-2's ~4.4, so the same model quality shows up as a higher
-per-token loss here. This branch therefore logs bits per byte next to the usual figure:
+Per-token loss is not comparable across tokenizers, so every validation also prints bits per
+byte (the control does too):
 
 ```
-step:1290/1290 val_loss:3.9012 val_bpb:0.9421 train_time:...
-final val_loss:3.9012 nats/token over 10485760 tokens = 61877597 bytes -> val_bpb:0.9421 bits/byte (5.901 bytes/token)
+step:1194/1194 val_loss:… val_bpb:… train_time:…
+final val_loss:… nats/token over 10,485,760 tokens = … bytes -> val_bpb:… bits/byte (… bytes/token)
 ```
 
-`val_bpb = val_loss × tokens ÷ bytes ÷ ln 2`, where bytes are the UTF-8 bytes of the target
-tokens. `<|endoftext|>` counts as 0 bytes, so its cost is amortized over the real text.
+Validation runs at steps 0, 250, 500, then every 25 steps from step 600. Intermediate
+validations use neither the canonical mask nor the tail-averaged weights, and they run on the
+clock, so `train_time` compares between arms but not with the record.
 
-The `master` baseline only prints nats. Convert it with the byte count of the GPT-2
-validation window:
-
-```python
-import numpy as np, tiktoken
-enc = tiktoken.get_encoding("gpt2")
-t = np.memmap("data/fineweb10B/fineweb_val_000000.bin", dtype=np.uint16, offset=1024)[:10_485_760]
-b = sum(len(enc.decode_single_token_bytes(int(i))) for i in t if i != 50256)
-print("bits per byte =", "val_loss *", 10_485_760 / (b * np.log(2)))
-```
-
-Two caveats when reading the numbers:
-
-1. **Corpus and tokenizer change together.** `master` trains on FineWeb; this branch trains
-   on FineWeb-Edu. To isolate the tokenizer, run the baseline on `kjj0/finewebedu10B-gpt2`
-   instead (see `data/cached_finewebedu10B.py`, whose files are named `finewebedu_*.bin`, so
-   point `train_files`/`val_files` at them).
-2. **Canonical masking (record 91) is kept, rebuilt for this vocabulary.** Both arms get
-   it, so neither is handicapped. See the change table below for what had to be adjusted.
-
-## What changed from `master`
+## What changed from `anvil2_bpb_control`
 
 | Where | Change |
 |---|---|
-| `train_gpt.py` | `BOS_ID = 50303` (`<\|endoftext\|>` in this vocabulary, was GPT-2's 50256) |
-| `train_gpt.py` | `train_files`/`val_files` → `data/finewebedu10B_superbpe/` |
-| `train_gpt.py` | `superbpe_ranks()` reads the published `.tiktoken`; `build_prefix_table` uses it instead of `tiktoken.get_encoding("gpt2")` |
-| `train_gpt.py` | `build_canonical_mask` rebuilt for this vocabulary (see below) |
-| `train_gpt.py` | Validation logs `val_bpb` alongside `val_loss` |
-| `data/cached_superbpe_finewebedu10B.py` | New download script (shards + vocabulary) |
+| `track_1_short/superbpe_vocab.py` | New: dataset, data directory, `<\|endoftext\|>` = 50303, and the `.tiktoken` vocabulary reader |
+| `track_1_short/config.py` | `train_files` / `val_files` → `data/finewebedu10B_superbpe/` |
+| `track_1_short/data.py` | `BOS_ID = 50303`; cu_seqlens rows 64/96/128/128 → 96/128/160/192 |
+| `track_1_short/sampled_softmax.py` | candidate counts: stage 1 10240 → 12288, stage 2 14336 → 16384 (first two thirds) |
+| `track_1_short/model/prefix_prediction.py` | prefix table from the SuperBPE vocabulary |
+| `track_1_short/canonical_mask.py` | rebuilt for this vocabulary (below) |
+| `track_1_short/bits_per_byte.py` | byte lengths from the SuperBPE vocabulary |
+| `data/cached_superbpe.py` | New download script |
 
-### Canonical masking with this vocabulary
+**Why the two size changes.** Replaying master's loader over each SuperBPE dataset's first
+train shard: a microbatch holds more distinct targets than with GPT-2, because the vocabulary is
+used more evenly (worst mean/max 10,714/11,495 at batch 16, against GPT-2's 7,211/8,032). Upstream's
+sampled-softmax counts would trip `assert num_targets <= P` on most stage-1 steps. FineWeb
+documents are also fewer tokens under SuperBPE (541 against GPT-2's 691), which overflows the
+per-batch cu_seqlens table. The new values are the smallest legal ones that keep master's safety
+margin. Stage 0's count and the last third of stage 2 were already large enough.
 
-Record 91 masks `(prev, cur)` pairs the tokenizer would never emit. Two of its assumptions
-come from GPT-2 and had to be replaced:
+**Canonical mask.** This vocabulary is encoded with `pat_str = [\s\S]+` (no pretokenization), so
+the GPT-2 seam rules (whitespace runs, contractions) are dropped. Documents are split at blank
+lines and long paragraphs are cut before a space, so tokens starting with `' '` or `'\n'` are never
+masked. Replaying the mask against each dataset's val window and first 20M train tokens finds
+0 masked real pairs for all three SuperBPE datasets. The build takes ~12 s on a laptop (GPT-2's: ~5 s),
+which still fits inside training, alongside it in the background.
 
-* **Pretokenization.** Upstream stops merges at word boundaries (whitespace runs,
-  contractions). This vocabulary is encoded with `pat_str = r"[\s\S]+"`, so no seam is
-  protected and `_SEAM_OK` is all True apart from the mid-character rule. That masks
-  *more*, not less.
-* **One-pass documents.** `tokenize_fineweb_edu.py` splits at blank lines and cuts
-  paragraphs over 8,192 characters before a space, so a piece can begin after any token.
-  Tokens starting with `' '` or `'\n'` are therefore cleared from every row.
+| dataset | val window bytes | bytes/token | mask density |
+|---|---|---|---|
+| GPT-2 control (FineWeb) | 46,515,256 | 4.436 | — |
+| 3digit (FineWeb-Edu) | 61,877,600 | 5.901 | 2.03% |
+| nodigitsplit (FineWeb-Edu) | 62,003,470 | 5.913 | 2.03% |
+| gpt2split (FineWeb) | 59,371,532 | 5.662 | 2.18% |
 
-Verified by replaying the finished mask against the shards:
+The validation window is a fixed 10,485,760 tokens, so a SuperBPE arm is scored on more text
+than the control. The gpt2split val shard begins with the same documents as the control's.
 
-| | Pairs wrongly masked in the 10,485,760-token val window | Vocabulary masked per position |
-|---|---|---|
-| Without the piece-boundary rule | 428 | 2.4% |
-| As committed | **0** | **2.1%** |
-
-Also 0 wrongly masked in the first 20M tokens of `fineweb_train_000001.bin`. The check is
-tied to the data, so re-run it if `val_tokens` grows or the shards are ever regenerated with
-a different `--max-piece`.
-
-Unchanged and verified as compatible: `GPT(vocab_size=50257)` still pads to 50,304, which
-holds every id here; and the per-batch document caps are not exceeded by these shards
-(worst case 49/63, 85/95, 114/127 per rank across the three stages; 407/895 for validation).
+Unchanged and compatible: `GPT(vocab_size=50257)` pads to 50,304, which holds every id here.
+`evals/hellaswag.py` (off by default) still tokenizes with GPT-2.
 
 ---
 
@@ -117,14 +79,14 @@ This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|compe
 The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 replication in llm.c, which attains that loss after running for 45 minutes](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
-* Under 75 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
-* under 400M tokens (the llm.c GPT-2 replication needed 10B)
+* Under 40 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
+* under 330M tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
 * The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon/)] [[repo](https://github.com/KellerJordan/Muon)]
 * Use FP8 for head, and asymmetric rescale and softcap logits
-* Use FP8 on MLP forward pass
+* FP8 for the MLP forward and backward passes and the QKV projections
 * Initialization of projections to zero (muP-like)
 * Skip connections from embedding to every block as well as from block 3 to 6
 * Extra embeddings which are mixed into the values in attention layers (inspired by Zhou et al. 2024)
@@ -145,11 +107,17 @@ This improvement in training speed has been brought about by the following techn
 * Untie embed and lm_head at 2/3 of training
 * Additional gating on value embeddings and skip connection
 * Paired head attention
-* Bigram hash embedding on 1/4 of model_dim w/ sign trick
+* Hashed bigram + trigram embedding table (84.6M rows, 65B parameters) w/ sign trick, sharded across GPUs
 * MUDD skip connections to residual stream and attention values
 * Learnable XSA
 * Lightweight Dynamically Composable MHA
 * Prefix token prediction auxiliary loss
+* ANVIL optimizer: twin-rail (fast + slow) momentum, re-derived orthogonalization maps, cautious decay gated on the slow rail
+* Sampled softmax over a shared candidate set for most of training
+* Sparse row-wise embedding updates: only touched rows are exchanged and updated (beta1 = 0, one second-moment value per row), every 4 steps
+* Depth reduction and mixed-width attention (64-dim QK on most layers, half-width V on two layers)
+* Tail weight averaging (EMA) with a raised LR floor
+* CUDA-graph capture of the training step, optimizer and FP8 weight refresh
 
 As well as many systems optimizations.
 
@@ -171,7 +139,7 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua), [@Lisennlp](https://github.com/Lisennlp),
 [@_djdumpling](https://x.com/_djdumpling), [@TrianX](https://x.com/TrianX), [@aryavohra](https://github.com/aryavohra),
 [@cong_ml](https://x.com/cong_ml), [@jvarho](https://github.com/jvarho), [@Mister-dev-oss](https://github.com/Mister-dev-oss), [@CerovazS](https://github.com/CerovazS), [@MarioPaerle](https://github.com/MarioPaerle), [@GabrieleCirillo](https://github.com/GabrieleCirillo), [@crisostomi](https://github.com/crisostomi),
-[@theonlyglitch_](https://x.com/theonlyglitch_)
+[@theonlyglitch_](https://x.com/theonlyglitch_), [@DevenPzak](https://x.com/DevenPzak)
 
 
 ---
@@ -182,13 +150,29 @@ To run the current record, run the following commands.
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
 pip install -r requirements.txt
+pip install torch==2.10 --index-url https://download.pytorch.org/whl/cu128  # the pinned build, not a nightly
 # downloads only the first 900M training tokens to save time
 python data/cached_fineweb10B.py 9
 ./run.sh
 ```
 Add torchrun to path if ./run.sh gives error `torchrun: command not found`.
 
+The attention kernel is a patched FlashAttention-3 build (`devenpzak/flash-attn3-12864`) that links `libcudart.so.13`,
+so the system needs a CUDA 13 runtime (the Docker image below provides one). If `get_kernel` fails to download it
+anonymously, either run `hf auth login`, or pre-seed the kernel cache and run offline:
+```bash
+hf download devenpzak/flash-attn3-12864 --revision 64c1e6d1f2780e7931839f41426ddcdb564a7cb9
+HUB=${HF_HOME:-~/.cache/huggingface}/hub
+cp -rl $HUB/models--devenpzak--flash-attn3-12864 $HUB/kernels--devenpzak--flash-attn3-12864
+HF_HUB_OFFLINE=1 ./run.sh
+```
+
 **Note: torch.compile will add around 7 minutes of latency the first time you run the code.**
+
+The track-1 trainer is `train_gpt.py` plus the `track_1_short/` package. `train_gpt.py` is the outline of a run
+(setup, model, warmup and CUDA-graph capture, the timed loop, the final validation); `track_1_short/` holds the model,
+optimizer, data and schedules, and `track_1_short/perf/` holds the kernels and systems tricks that make it fast, which
+can be skipped when reading for the algorithm. Every run log embeds the full source of both.
 
 Official records are timed on 8 NVIDIA H100 GPUs from https://app.primeintellect.ai/. PrimeIntellect has generously sponsored recent validation runs.
 
@@ -315,6 +299,9 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 89 | 1.23 minutes | [MLP down projection in FP8 with efficient delayed scaling metric](https://x.com/classiclarryd/status/2086582390135406713) | 07/17/26 | [log](records/track_1_short/2026-07-17_FP8DownProjection/this_pr/11cb620c-daaf-4e85-83fc-258a5eb7ba09.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/342)  | @Mister-dev-oss, @CerovazS, @MarioPaerle, @GabrieleCirillo, @crisostomi
 90 | 1.13 minutes | 128 -> 96 dim QK, Fuse QK Norm, RoPE, and KeyOffset into Triton, Move MLP bwk to FP8, Move QKV fwd and bwk to FP8.  | 08/03/26 | [log](records/track_1_short/2026-08-03_FP8MLPBackwardPackedQKV),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/344)  | @theonlyglitch_
 91 | 1.126 minutes | Mask logits for infeasible token continuations during validation.  | 08/06/26 | [log](records/track_1_short/2026-08-06-CanonicalMasking),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/350)  | @jvarho
+92 | 0.665 minutes | Sampled softmax over the early stages,  full FP8 MLP fwd+bwd, 84.6M-row hashed n-gram table, ANVIL optimizer stack, depth reduction + mixed-width QK attention, full CUDA-graph capture of the training step | 08/30/26 | [log](records/track_1_short/2026-08-30_ANVIL2),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/360) | @DevenPzak
+
+
 ## Rules
 
 New records must:
