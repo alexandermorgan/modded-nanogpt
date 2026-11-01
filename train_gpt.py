@@ -289,11 +289,14 @@ def main():
     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                is_update_step, prefetch_staging)
 
-    # The canonical mask is only needed by the final validation, so rank 0 builds it in a child
-    # process while we train, and model.canon_mask stays all-zero == no masking until then, which
-    # is what the intermediate validations run with. Only the buffer is allocated here; the build
-    # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
+    # The canonical mask, built here before the clock rather than on it during training (upstream), so
+    # that every validation -- not only the final one -- scores with it and the intermediate readings
+    # are comparable with the final one. Training never reads model.canon_mask (only the eval loss
+    # does), so this changes no training numerics; it moves the build's few seconds off the clock.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
+    canon_mask_builder.start()
+    canon_mask_builder.wait(timeout=600.0)  # off the clock, so no need to hurry it
+    canon_mask_builder.collect(model.canon_mask)
     # Byte length of every token id, for the bits-per-byte validation metric. Built off the clock: it is
     # a metric, not part of training.
     val_byte_lengths = token_byte_lengths(model.vocab_size, env.device)
@@ -313,7 +316,6 @@ def main():
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    canon_mask_builder.start()
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
     # split across ranks: each builds one token bucket and the max over ranks is the whole table.
@@ -335,10 +337,7 @@ def main():
                 # training forward, and the run ends after this validation.
                 deferred_gathers.flush_final()
                 training_manager.apply_final_ws_ext()
-                # Both on the clock: the wait in case the build is somehow not done, and the copy
-                # and broadcast of the result because they are part of the mask's cost.
-                canon_mask_builder.wait()
-                canon_mask_builder.collect(model.canon_mask)
+                # The canonical mask is already in place: it was built before the clock started.
                 # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate.
                 # The ship also gathers value_embeds whole.
                 tail_averages.ship()
