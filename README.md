@@ -23,12 +23,13 @@ NUM_SCHEDULED_ITERATIONS=1142 bash run.sh            # 1142 + 52 + 20 = 1214 tot
 ```
 
 **Choosing the length.** The two full-length `superbpe_vocab_gpt2split` runs of 2026-11-09 end at 1.0679
-and 1.0681 bits per byte (mean 1.0680), against the control's 1.0650 (one run, val_loss 3.2746; the
-3.28 gate is 1.0667). No validation reaches 1.0650, so the curve gives no crossing step to shorten
-to. The gap is instead priced with record #360's exchange rate for buying validation loss with extra
+and 1.0681 bits per byte (mean 1.0680), against the control's 1.0654 (mean of two runs: 1.0650 on
+2026-11-06, 1.0658 on 2026-11-09; the 3.28 gate is 1.0667). No validation reaches 1.0654, so the curve
+gives no crossing step to shorten to. (It leads the control early, by 0.012 at step 600, and falls
+behind from about step 700: the control's curve is the steeper one.) The gap is instead priced with record #360's exchange rate for buying validation loss with extra
 training steps, 164 ms per millinat (measured band 120-250). One millinat of GPT-2 val_loss is
-0.000325 bits per byte on the control's validation window, so the 0.0030 gap is about 9.2 millinats:
-**about 1.5 s more training** (1.1-2.3 s), some 43 steps at the full run's average 35 ms per step.
+0.000325 bits per byte on the control's validation window, so the 0.0026 gap is about 8.0 millinats:
+**about 1.3 s more training** (1.0-2.0 s), some 37 steps at the full run's average 35 ms per step.
 Usable totals above 1194, with the training time from the measured per-stage step times (17, 31.5,
 47, 49 and 30 ms per step):
 
@@ -42,7 +43,9 @@ Usable totals above 1194, with the training time from the measured per-stage ste
 1250 is the first usable total that covers the central estimate. Try 1214 if it lands well below the
 target, 1290 if it lands above. Caveats: the exchange rate was measured on GPT-2 tokens and is carried
 over per bit per byte; it is a marginal rate, so it holds for small changes like this one; and the
-1.0650 target is one control run.
+target rests on two control runs on two machines. On the same machine this arm also trains slightly
+slower than the control over a full run (42.0 s against 41.2 s), so a 1250-step run costs about
++2.5 s of training against the control's 1194, not +1.9 s.
 
 **Usable totals.** `step_counts` lists the totals that keep what record #360 kept when it grew its
 run: total ≡ 1194 (mod 4), each stage boundary on a step of the record's parity (Adam params update
