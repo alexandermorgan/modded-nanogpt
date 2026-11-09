@@ -1,50 +1,49 @@
 # Modded-NanoGPT — branch `superbpe_vocab_nodigitsplit_short`
 
 `superbpe_vocab_nodigitsplit` with a **shortened run**, to find how few steps the SuperBPE vocabulary
-needs to match the control's final bits per byte. Two settings differ from that branch, both in
-`track_1_short/config.py`:
+needs to match the control's final bits per byte. Two things differ from that branch:
 
-| Setting | `superbpe_vocab_nodigitsplit` | here |
+| | `superbpe_vocab_nodigitsplit` | here |
 |---|---|---|
-| `NUM_SCHEDULED_ITERATIONS` (default) | 1122 → 1194 total steps | 618 → 690 total steps (estimate, below) |
-| dense validation | every 25 steps from 600 | off: steps 0, 250, 500, 750 and the last, as upstream |
+| `NUM_SCHEDULED_ITERATIONS` (default, `config.py`) | 1122 → 1194 total steps | 582 → 654 total steps (estimate, below) |
+| validation | every 25 steps from step 600, canonical mask from 600 | upstream's: every 250 steps and the last, canonical mask at the last only |
 
-With dense validation off, `train_time` carries upstream's validation cost only, so it compares with
-the record's. Set the length per run with the environment variable; the stage boundaries, lr
-cooldown, candidate-count ramp and warmup steps all follow it:
+So `train_time` carries upstream's validation cost only and compares with the record's. Every
+validation still prints bits per byte. Set the length per run with the environment variable; the
+stage boundaries, lr cooldown, candidate-count ramp and warmup steps all follow it:
 
 ```bash
 python data/cached_superbpe.py 9                     # same data as superbpe_vocab_nodigitsplit
-python -m track_1_short.step_counts 840              # usable totals nearest 840, with their settings
-NUM_SCHEDULED_ITERATIONS=750 bash run.sh             # 750 + 52 + 20 = 822 total steps
+python -m track_1_short.step_counts 700              # usable totals nearest 700, with their settings
+NUM_SCHEDULED_ITERATIONS=618 bash run.sh             # 618 + 52 + 20 = 690 total steps
 ```
 
-**Choosing the length.** In a full-length run, the first dense validation at or below the control's
-final bits per byte gives an upper bound: a run that *ends* there also gets the full lr cooldown, the
-tail averages and the extended final window, all of which the intermediate validation lacked. Start
-at the usable total at or above that step, then step down.
+**Choosing the length.** In a full-length run of `superbpe_vocab_nodigitsplit`, the first dense
+validation at or below the control's final bits per byte gives an upper bound: a run that *ends* there
+also gets the full lr cooldown, the tail averages and the extended final window, all of which the
+intermediate validation lacked.
 
-**The current estimate: 690 total steps** (`NUM_SCHEDULED_ITERATIONS=618`), from the two full-length
-runs of `superbpe_vocab_3digit_splits` (2026-11-09, final 0.9639 and 0.9635 bits per byte) against the
+**The current estimate: 654 total steps** (`NUM_SCHEDULED_ITERATIONS=582`), from the two full-length
+`superbpe_vocab_nodigitsplit` runs of 2026-11-09 (final 0.9618 and 0.9626 bits per byte) against the
 control's final 1.0650 (one run, val_loss 3.2746; the 3.28 gate is 1.0667):
 
 | Bound | Total steps | How |
 |---|---|---|
-| upper (safe) | 750 | first masked validation at or below 1.0650: step 725 in one run, 750 in the other |
-| lower (optimistic) | ~590 | a shortened run that trains on as many tokens as the full run had by step 750: its stages reach the larger batches sooner. Optimistic because large-batch tokens train less efficiently than small-batch ones |
+| upper (safe) | 730 | both runs first validate at or below 1.0650 at step 725 (1.0568 and 1.0634; step 700 read 1.0676 and 1.0689); 730 is the usable total at or above it |
+| lower (optimistic) | ~586 | a shortened run trains on as many tokens as the full run had by step 725 at about 586 steps, because its stages reach the larger batches sooner. Optimistic: large-batch tokens train less efficiently than small-batch ones. 586 is also the shortest total the tail averages allow |
 
-690 is the usable total just above the midpoint. From the per-stage step times of those runs (17, 31.5, 47,
-49 and 30 ms) a 690-step run trains for about 24 s, against 41.9 s at 1194 steps. Step down (654, 618)
-if it lands below the target, up (730, 750) if not. Two caveats: the 3digit arm stands in for
-nodigitsplit, and both validate on FineWeb-Edu while the control validates on FineWeb, so equal bits per
-byte is not equal text.
+654 is the usable total nearest the midpoint. From the per-stage step times of the full-length runs
+(17, 31.5, 47, 49 and 30 ms per step) a 654-step run trains for about 22.7 s, against 41.8 s at 1194
+steps (690: 23.9 s, 730: 25.2 s). Step down (618) if it lands below the target, up (690, 730) if not.
+The 3digit runs (final 0.9639 and 0.9635) cross later, at steps 725 and 750. Caveat: both SuperBPE
+arms validate on FineWeb-Edu and the control on FineWeb, so equal bits per byte is not equal text.
 
 **Usable totals.** `step_counts` lists the totals that keep what record #360 kept when it grew its
 run: total ≡ 1194 (mod 4), each stage boundary on a step of the record's parity (Adam params update
-on odd steps only), and the tail-average assert (total ≥ 586). Between 600 and 800 they are 618, 654, 690, 694, 730, 750, 786.
-Other totals run too; they leave the record's tuned step alignment. Absolute step constants do not
-scale with the run: the n-gram table's period-4 cadence starts at step 336, the rail engages at 514
-and the rail beta warms up over 240 steps.
+on odd steps only), and the tail-average assert (total ≥ 586). Between 600 and 800 they are 618, 654,
+690, 694, 730, 750, 786. Other totals run too; they leave the record's tuned step alignment. Absolute
+step constants do not scale with the run: the n-gram table's period-4 cadence starts at step 336, the
+rail engages at 514 and the rail beta warms up over 240 steps.
 
 The rest of this README is `superbpe_vocab_nodigitsplit`'s.
 

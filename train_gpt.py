@@ -292,9 +292,7 @@ def main():
     # The canonical mask: rank 0 builds it in a child process while we train, and model.canon_mask stays
     # all-zero == no masking until it is collected. Only the buffer is allocated here; the build is
     # started below the clock, so its whole cost -- not just its use -- lands in the timed region.
-    # Upstream collects it at the final validation; here it is collected (on the clock) at the first
-    # dense validation, args.val_dense_from, so that every reading from there on is masked and
-    # comparable with the final one. The validations before it are logged as unmasked.
+    # As upstream, it is collected at the final validation; the earlier ones are logged as unmasked.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
     canon_mask_collected = False
     # Byte length of every token id, for the bits-per-byte validation metric. Built off the clock: it is
@@ -330,7 +328,7 @@ def main():
         last_step = (step == training_schedule.total_steps)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
-        if last_step or args.is_val_step(step):
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             # The deferred gathers land first: validation reads the banks and, at the last step, ships
             # into them.
             if last_step:
@@ -339,23 +337,15 @@ def main():
                 deferred_gathers.flush_final()
                 training_manager.apply_final_ws_ext()
                 # Both on the clock: the wait in case the build is somehow not done, and the copy
-                # and broadcast of the result because they are part of the mask's cost. Already done
-                # at val_dense_from when the run reaches it.
-                if not canon_mask_collected:
-                    canon_mask_builder.wait()
-                    canon_mask_builder.collect(model.canon_mask)
-                    canon_mask_collected = True
+                # and broadcast of the result because they are part of the mask's cost.
+                canon_mask_builder.wait()
+                canon_mask_builder.collect(model.canon_mask)
+                canon_mask_collected = True
                 # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate.
                 # The ship also gathers value_embeds whole.
                 tail_averages.ship()
             else:
                 deferred_gathers.flush()
-                # On the clock, as at the final validation: from the first dense validation on, every
-                # validation scores with the canonical mask.
-                if step >= args.val_dense_from and not canon_mask_collected:
-                    canon_mask_builder.wait()
-                    canon_mask_builder.collect(model.canon_mask)
-                    canon_mask_collected = True
                 # On the clock: only the live cycle's rows of each value_embeds replica are current, and
                 # validation reads every token (perf/value_embed_pull.py).
                 value_embed_pull.gather_replica()
