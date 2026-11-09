@@ -25,7 +25,10 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
     # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1122"))
+    # Resized run: 1178 + 52 + 20 = 1250 total steps, longer than the record's 1194 because this
+    # vocabulary ends above the control at 1194 (README: "Choosing the length").
+    # `python -m track_1_short.step_counts` lists the counts that keep the record's step parities.
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1178"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -33,20 +36,10 @@ class Hyperparameters:
     # validation is on the clock -- the val reads and n-gram pulls, the value_embeds gather, the drained
     # CUDA-graph run-ahead and the cycle re-land after it cost ~0.2-0.5 s over a run at 250).
     val_loss_every: int = 250
-    # From this step on, evaluate every val_dense_every steps instead, to trace the end of the loss
-    # curve (bits-per-byte tokenizer experiment). 0 turns the dense phase off.
-    val_dense_from: int = 600
-    val_dense_every: int = 25
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # reproducibility: unset means a random init; any integer (0 included) seeds it
     train_seed: int | None = int(os.environ["TRAIN_SEED"]) if "TRAIN_SEED" in os.environ else None
-
-    def is_val_step(self, step: int) -> bool:
-        """Whether to validate at `step`, the final step aside (always validated)."""
-        dense = self.val_dense_every > 0 and step >= self.val_dense_from
-        every = self.val_dense_every if dense else self.val_loss_every
-        return every > 0 and step % every == 0
 
 @dataclass(slots=True)
 class TrainingStage:

@@ -1,34 +1,56 @@
-# Modded-NanoGPT — branch `superbpe_vocab_gpt2split`
+# Modded-NanoGPT — branch `superbpe_vocab_gpt2split_short`
 
-The ANVIL2 record trainer (master, plus the bits-per-byte control `anvil2_bpb_control`) on
-**FineWeb 10B (the corpus master trains on) tokenized with a 50,304-token SuperBPE vocabulary whose first phase uses GPT-2's split pattern**, a semi-control: the corpus and first-phase split match the control, and only the SuperBPE second phase is new
-([`alexandermorgan/fineweb10B-superbpe50304-gpt2split`](https://huggingface.co/datasets/alexandermorgan/fineweb10B-superbpe50304-gpt2split)).
-It is a copy of `superbpe_vocab_3digit_splits` that differs in the dataset constants of
-`track_1_short/superbpe_vocab.py` and, unlike the two FineWeb-Edu branches, also enlarges the
-cu_seqlens table in `data.py` (see below): FineWeb documents average 541 SuperBPE tokens against
-GPT-2's 691 (FineWeb-Edu's: 790), so more fit in a batch and overflow upstream's table.
+`superbpe_vocab_gpt2split` (FineWeb 10B, the control's corpus and validation documents, with a
+50,304-token SuperBPE vocabulary whose first phase uses GPT-2's split pattern) **resized to the step
+count it needs to match the control's final bits per byte**. That turns out to be *more* steps than the
+record's 1194, not fewer: on the same text, this vocabulary ends above the control. Two things differ
+from `superbpe_vocab_gpt2split`, the same two as in `superbpe_vocab_nodigitsplit_short`:
+
+| | `superbpe_vocab_gpt2split` | here |
+|---|---|---|
+| `NUM_SCHEDULED_ITERATIONS` (default, `config.py`) | 1122 → 1194 total steps | 1178 → 1250 total steps (estimate, below) |
+| validation | every 25 steps from step 600, canonical mask from 600 | upstream's: every 250 steps and the last, canonical mask at the last only |
+
+So `train_time` carries upstream's validation cost only and compares with the record's. Every
+validation still prints bits per byte. The enlarged cu_seqlens table of `superbpe_vocab_gpt2split`
+(`data.py`) is kept. Set the length per run with the environment variable; the stage boundaries, lr
+cooldown, candidate-count ramp and warmup steps all follow it:
 
 ```bash
-python data/cached_superbpe.py 9   # shards + vocabulary into data/fineweb10B_superbpe_gpt2split/
-bash run.sh                        # 8xH100, as master
+python data/cached_superbpe.py 9                     # same data as superbpe_vocab_gpt2split
+python -m track_1_short.step_counts 1240             # usable totals nearest 1240, with their settings
+NUM_SCHEDULED_ITERATIONS=1142 bash run.sh            # 1142 + 52 + 20 = 1214 total steps
 ```
 
-## Reading the results
+**Choosing the length.** The two full-length `superbpe_vocab_gpt2split` runs of 2026-11-09 end at 1.0679
+and 1.0681 bits per byte (mean 1.0680), against the control's 1.0650 (one run, val_loss 3.2746; the
+3.28 gate is 1.0667). No validation reaches 1.0650, so the curve gives no crossing step to shorten
+to. The gap is instead priced with record #360's exchange rate for buying validation loss with extra
+training steps, 164 ms per millinat (measured band 120-250). One millinat of GPT-2 val_loss is
+0.000325 bits per byte on the control's validation window, so the 0.0030 gap is about 9.2 millinats:
+**about 1.5 s more training** (1.1-2.3 s), some 43 steps at the full run's average 35 ms per step.
+Usable totals above 1194, with the training time from the measured per-stage step times (17, 31.5,
+47, 49 and 30 ms per step):
 
-Per-token loss is not comparable across tokenizers, so every validation also prints bits per
-byte (the control does too):
+| Total | `NUM_SCHEDULED_ITERATIONS` | training | vs 1194 |
+|---|---|---|---|
+| 1214 | 1142 | ~41.5 s | +0.7 s |
+| **1250** | **1178** | **~42.7 s** | **+1.9 s** |
+| 1254 | 1182 | ~42.9 s | +2.0 s |
+| 1290 | 1218 | ~44.1 s | +3.2 s |
 
-```
-step:1194/1194 val_loss:… val_bpb:… train_time:…
-final val_loss:… nats/token over 10,485,760 tokens = … bytes -> val_bpb:… bits/byte (… bytes/token)
-```
+1250 is the first usable total that covers the central estimate. Try 1214 if it lands well below the
+target, 1290 if it lands above. Caveats: the exchange rate was measured on GPT-2 tokens and is carried
+over per bit per byte; it is a marginal rate, so it holds for small changes like this one; and the
+1.0650 target is one control run.
 
-Validation runs at steps 0, 250, 500, then every 25 steps from step 600. The canonical mask is
-built on the clock alongside training, as upstream, but collected at step 600 rather than at the
-end, so every validation from step 600 on is masked; the earlier ones are marked `(unmasked)`.
-Only the final validation evaluates the tail-averaged weights with the extended attention
-window. Intermediate validations run on the clock, so `train_time` compares between arms but
-not with the record.
+**Usable totals.** `step_counts` lists the totals that keep what record #360 kept when it grew its
+run: total ≡ 1194 (mod 4), each stage boundary on a step of the record's parity (Adam params update
+on odd steps only), and the tail-average assert (total ≥ 586). Absolute step constants do not scale
+with the run: the n-gram table's period-4 cadence starts at step 336, the rail engages at 514 and the
+rail beta warms up over 240 steps.
+
+The rest of this README is `superbpe_vocab_gpt2split`'s.
 
 ## What changed from `anvil2_bpb_control`
 
