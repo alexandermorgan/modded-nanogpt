@@ -6,7 +6,7 @@ needs to match the control's final bits per byte. Two settings differ from that 
 
 | Setting | `superbpe_vocab_nodigitsplit` | here |
 |---|---|---|
-| `NUM_SCHEDULED_ITERATIONS` (default) | 1122 → 1194 total steps | 786 → 858 total steps (placeholder) |
+| `NUM_SCHEDULED_ITERATIONS` (default) | 1122 → 1194 total steps | 618 → 690 total steps (estimate, below) |
 | dense validation | every 25 steps from 600 | off: steps 0, 250, 500, 750 and the last, as upstream |
 
 With dense validation off, `train_time` carries upstream's validation cost only, so it compares with
@@ -24,9 +24,24 @@ final bits per byte gives an upper bound: a run that *ends* there also gets the 
 tail averages and the extended final window, all of which the intermediate validation lacked. Start
 at the usable total at or above that step, then step down.
 
+**The current estimate: 690 total steps** (`NUM_SCHEDULED_ITERATIONS=618`), from the two full-length
+runs of `superbpe_vocab_3digit_splits` (2026-11-09, final 0.9639 and 0.9635 bits per byte) against the
+control's final 1.0650 (one run, val_loss 3.2746; the 3.28 gate is 1.0667):
+
+| Bound | Total steps | How |
+|---|---|---|
+| upper (safe) | 750 | first masked validation at or below 1.0650: step 725 in one run, 750 in the other |
+| lower (optimistic) | ~590 | a shortened run that trains on as many tokens as the full run had by step 750: its stages reach the larger batches sooner. Optimistic because large-batch tokens train less efficiently than small-batch ones |
+
+690 is the usable total just above the midpoint. From the per-stage step times of those runs (17, 31.5, 47,
+49 and 30 ms) a 690-step run trains for about 24 s, against 41.9 s at 1194 steps. Step down (654, 618)
+if it lands below the target, up (730, 750) if not. Two caveats: the 3digit arm stands in for
+nodigitsplit, and both validate on FineWeb-Edu while the control validates on FineWeb, so equal bits per
+byte is not equal text.
+
 **Usable totals.** `step_counts` lists the totals that keep what record #360 kept when it grew its
 run: total ≡ 1194 (mod 4), each stage boundary on a step of the record's parity (Adam params update
-on odd steps only), and the tail-average assert (total ≥ 586). Near 850 they are 822, 858, 862, 914.
+on odd steps only), and the tail-average assert (total ≥ 586). Between 600 and 800 they are 618, 654, 690, 694, 730, 750, 786.
 Other totals run too; they leave the record's tuned step alignment. Absolute step constants do not
 scale with the run: the n-gram table's period-4 cadence starts at step 336, the rail engages at 514
 and the rail beta warms up over 240 steps.

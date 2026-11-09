@@ -25,9 +25,10 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
     # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
-    # Shortened run: 786 + 52 + 20 = 858 total steps, a placeholder until the four-arm curves set it.
+    # Shortened run: 618 + 52 + 20 = 690 total steps, estimated from superbpe_vocab_3digit_splits'
+    # full-length curves (README: "Choosing the length").
     # `python -m track_1_short.step_counts` lists the counts that keep the record's step parities.
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "786"))
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "618"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
