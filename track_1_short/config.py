@@ -25,7 +25,9 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule: the base step count of the main stages (SCHEDULE_GROWTH_STEPS are added on top), then
     # the extension stage. The override is for step-count sweeps (record #360's KX_STEPS).
-    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1122"))
+    # Shortened run: 786 + 52 + 20 = 858 total steps, a placeholder until the four-arm curves set it.
+    # `python -m track_1_short.step_counts` lists the counts that keep the record's step parities.
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "786"))
     num_extension_iterations: int = 20
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -34,9 +36,10 @@ class Hyperparameters:
     # CUDA-graph run-ahead and the cycle re-land after it cost ~0.2-0.5 s over a run at 250).
     val_loss_every: int = 250
     # From this step on, evaluate every val_dense_every steps instead, to trace the end of the loss
-    # curve (bits-per-byte tokenizer experiment). 0 turns the dense phase off.
+    # curve (bits-per-byte tokenizer experiment). 0 turns the dense phase off: off here, so train_time
+    # carries upstream's validation cost only and compares with the record's.
     val_dense_from: int = 600
-    val_dense_every: int = 25
+    val_dense_every: int = 0
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # reproducibility: unset means a random init; any integer (0 included) seeds it

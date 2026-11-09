@@ -1,32 +1,37 @@
-# Modded-NanoGPT — branch `superbpe_vocab_nodigitsplit`
+# Modded-NanoGPT — branch `superbpe_vocab_nodigitsplit_short`
 
-The ANVIL2 record trainer (master, plus the bits-per-byte control `anvil2_bpb_control`) on
-**FineWeb-Edu 10B tokenized with a 50,304-token SuperBPE vocabulary whose first phase leaves digit runs unsplit**
-([`alexandermorgan/fineweb-edu10B-superbpe50304-nodigitsplit`](https://huggingface.co/datasets/alexandermorgan/fineweb-edu10B-superbpe50304-nodigitsplit)).
-It is a copy of `superbpe_vocab_3digit_splits` that differs only in the dataset constants of
-`track_1_short/superbpe_vocab.py`; everything below applies unchanged.
+`superbpe_vocab_nodigitsplit` with a **shortened run**, to find how few steps the SuperBPE vocabulary
+needs to match the control's final bits per byte. Two settings differ from that branch, both in
+`track_1_short/config.py`:
+
+| Setting | `superbpe_vocab_nodigitsplit` | here |
+|---|---|---|
+| `NUM_SCHEDULED_ITERATIONS` (default) | 1122 → 1194 total steps | 786 → 858 total steps (placeholder) |
+| dense validation | every 25 steps from 600 | off: steps 0, 250, 500, 750 and the last, as upstream |
+
+With dense validation off, `train_time` carries upstream's validation cost only, so it compares with
+the record's. Set the length per run with the environment variable; the stage boundaries, lr
+cooldown, candidate-count ramp and warmup steps all follow it:
 
 ```bash
-python data/cached_superbpe.py 9   # shards + vocabulary into data/finewebedu10B_superbpe_nodigitsplit/
-bash run.sh                        # 8xH100, as master
+python data/cached_superbpe.py 9                     # same data as superbpe_vocab_nodigitsplit
+python -m track_1_short.step_counts 840              # usable totals nearest 840, with their settings
+NUM_SCHEDULED_ITERATIONS=750 bash run.sh             # 750 + 52 + 20 = 822 total steps
 ```
 
-## Reading the results
+**Choosing the length.** In a full-length run, the first dense validation at or below the control's
+final bits per byte gives an upper bound: a run that *ends* there also gets the full lr cooldown, the
+tail averages and the extended final window, all of which the intermediate validation lacked. Start
+at the usable total at or above that step, then step down.
 
-Per-token loss is not comparable across tokenizers, so every validation also prints bits per
-byte (the control does too):
+**Usable totals.** `step_counts` lists the totals that keep what record #360 kept when it grew its
+run: total ≡ 1194 (mod 4), each stage boundary on a step of the record's parity (Adam params update
+on odd steps only), and the tail-average assert (total ≥ 586). Near 850 they are 822, 858, 862, 914.
+Other totals run too; they leave the record's tuned step alignment. Absolute step constants do not
+scale with the run: the n-gram table's period-4 cadence starts at step 336, the rail engages at 514
+and the rail beta warms up over 240 steps.
 
-```
-step:1194/1194 val_loss:… val_bpb:… train_time:…
-final val_loss:… nats/token over 10,485,760 tokens = … bytes -> val_bpb:… bits/byte (… bytes/token)
-```
-
-Validation runs at steps 0, 250, 500, then every 25 steps from step 600. The canonical mask is
-built on the clock alongside training, as upstream, but collected at step 600 rather than at the
-end, so every validation from step 600 on is masked; the earlier ones are marked `(unmasked)`.
-Only the final validation evaluates the tail-averaged weights with the extended attention
-window. Intermediate validations run on the clock, so `train_time` compares between arms but
-not with the record.
+The rest of this README is `superbpe_vocab_nodigitsplit`'s.
 
 ## What changed from `anvil2_bpb_control`
 
